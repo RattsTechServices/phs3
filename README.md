@@ -57,6 +57,7 @@ This is useful for testing, development, or running your own minimal S3-like fil
    http://your-domain.com/bucket-name/object.txt
    ```
 
+>- NOTE: Use [laravel instructions](LARAVEL.md) to connect your application in your phs3 storage
 ---
 
 ## 🛠️ Running Locally with PHP Built-in Server
