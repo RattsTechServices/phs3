@@ -1,8 +1,25 @@
 <?php
+// Allow any origin
+header("Access-Control-Allow-Origin: *");
+
+// Allow these methods
+header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
+
+// Allow these headers (S3 clients typically use these)
+header("Access-Control-Allow-Headers: Authorization, Content-Type, X-Amz-Date, X-Amz-Security-Token, X-Amz-Content-Sha256, x-amz-acl, x-amz-meta-*");
+
+// Allow credentials if needed (optional)
+// header("Access-Control-Allow-Credentials: true");
+
+// Handle preflight OPTIONS request
+if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
+    http_response_code(200);
+    exit;
+}
 
 // Configuration
 define('DATA_DIR', __DIR__ . '/data'); // Use absolute path
-define('ALLOWED_ACCESS_KEYS', ['152bf7de-f7ea-45c4-a2eb-f0d3a49e2d2e']);
+define('ALLOWED_ACCESS_KEYS', ['use_any_string_here', 'default']);
 define('MAX_REQUEST_SIZE', 100 * 1024 * 1024); // 100MB
 
 // Helper functions
@@ -263,108 +280,109 @@ switch ($method) {
         break;
 
     case 'GET':
-        // Handle GET (download or list)
-        if (empty($key)) {
-            // Check if it's a ListObjectsV2 request
-            if (isset($_GET['list-type']) && $_GET['list-type'] == '2') {
-                $prefix = $_GET['prefix'] ?? '';
-                $files = list_files($bucket, $prefix);
+    // Handle GET (download or list)
+    if (empty($key)) {
+        // Check if it's a ListObjectsV2 request
+        if (isset($_GET['list-type']) && $_GET['list-type'] == '2') {
+            $prefix = $_GET['prefix'] ?? '';
+            $files = list_files($bucket, $prefix);
 
-                $xml = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></ListBucketResult>');
-                $xml->addChild('Name', $bucket);
-                $xml->addChild('Prefix', $prefix);
-                $xml->addChild('KeyCount', strval(count($files)));
-                $xml->addChild('MaxKeys', '1000');
-                $xml->addChild('IsTruncated', 'false');
+            $xml = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></ListBucketResult>');
+            $xml->addChild('Name', $bucket);
+            $xml->addChild('Prefix', $prefix);
+            $xml->addChild('KeyCount', strval(count($files)));
+            $xml->addChild('MaxKeys', '1000');
+            $xml->addChild('IsTruncated', 'false');
 
-                foreach ($files as $file) {
-                    $contents = $xml->addChild('Contents');
-                    $contents->addChild('Key', $file['key']);
-                    $contents->addChild('LastModified', date('Y-m-d\TH:i:s.000\Z', $file['timestamp']));
-                    $contents->addChild('ETag', '"' . md5_file(DATA_DIR . "/{$bucket}/{$file['key']}") . '"');
-                    $contents->addChild('Size', $file['size']);
-                    $contents->addChild('StorageClass', 'STANDARD');
-                }
+            foreach ($files as $file) {
+                $contents = $xml->addChild('Contents');
+                $contents->addChild('Key', $file['key']);
+                $contents->addChild('LastModified', date('Y-m-d\TH:i:s.000\Z', $file['timestamp']));
+                $contents->addChild('ETag', '"' . md5_file(DATA_DIR . "/{$bucket}/{$file['key']}") . '"');
+                $contents->addChild('Size', $file['size']);
+                $contents->addChild('StorageClass', 'STANDARD');
+            }
 
-                header('Content-Type: application/xml');
-                echo $xml->asXML();
+            header('Content-Type: application/xml');
+            echo $xml->asXML();
+            exit;
+        }
+
+        // Default fallback (ListObjects V1)
+        $prefix = $_GET['prefix'] ?? '';
+        $files = list_files($bucket, $prefix);
+        generate_s3_list_objects_response($files, $bucket, $prefix);
+
+    } else {
+        // Download object (unchanged)
+        $filePath = DATA_DIR . "/{$bucket}/{$key}";
+        if (!file_exists($filePath)) {
+            generate_s3_error_response('404', 'Object not found', "/{$bucket}/{$key}");
+        }
+
+        // Get file size
+        $filesize = filesize($filePath);
+
+        // Set default headers
+        $mimeType = mime_content_type($filePath) ?: 'application/octet-stream';
+        $fp = fopen($filePath, 'rb');
+
+        if ($fp === false) {
+            generate_s3_error_response('500', 'Failed to open file', "/{$bucket}/{$key}");
+        }
+
+        // Default response: full file
+        $start = 0;
+        $end = $filesize - 1;
+        $length = $filesize;
+
+        // Check for Range header
+        $range = $_SERVER['HTTP_RANGE'] ?? '';
+        if ($range && preg_match('/^bytes=(\d*)-(\d*)$/', $range, $matches)) {
+            http_response_code(206); // Partial Content
+
+            $start = $matches[1] === '' ? 0 : intval($matches[1]);
+            $end = $matches[2] === '' ? $filesize - 1 : min(intval($matches[2]), $filesize - 1);
+
+            if ($start > $end || $start < 0) {
+                header("Content-Range: bytes */$filesize");
+                http_response_code(416); // Requested Range Not Satisfiable
                 exit;
             }
 
-            // Default fallback (ListObjects V1)
-            $prefix = $_GET['prefix'] ?? '';
-            $files = list_files($bucket, $prefix);
-            generate_s3_list_objects_response($files, $bucket, $prefix);
+            $length = $end - $start + 1;
+
+            header("Content-Range: bytes {$start}-{$end}/{$filesize}");
+            header("Content-Length: " . $length);
         } else {
-            // Download object (unchanged)
-            $filePath = DATA_DIR . "/{$bucket}/{$key}";
-            if (!file_exists($filePath)) {
-                generate_s3_error_response('404', 'Object not found', "/{$bucket}/{$key}");
-            }
-
-            // Get file size
-            $filesize = filesize($filePath);
-
-            // Set default headers
-            $mimeType = mime_content_type($filePath) ?: 'application/octet-stream';
-            $fp = fopen($filePath, 'rb');
-
-            if ($fp === false) {
-                generate_s3_error_response('500', 'Failed to open file', "/{$bucket}/{$key}");
-            }
-
-            // Default response: full file
-            $start = 0;
-            $end = $filesize - 1;
-            $length = $filesize;
-
-            // Check for Range header
-            $range = $_SERVER['HTTP_RANGE'] ?? '';
-            if ($range && preg_match('/^bytes=(\d*)-(\d*)$/', $range, $matches)) {
-                http_response_code(206); // Partial Content
-
-                $start = $matches[1] === '' ? 0 : intval($matches[1]);
-                $end = $matches[2] === '' ? $filesize - 1 : min(intval($matches[2]), $filesize - 1);
-
-                if ($start > $end || $start < 0) {
-                    header("Content-Range: bytes */$filesize");
-                    http_response_code(416); // Requested Range Not Satisfiable
-                    exit;
-                }
-
-                $length = $end - $start + 1;
-
-                header("Content-Range: bytes {$start}-{$end}/{$filesize}");
-                header("Content-Length: " . $length);
-            } else {
-                http_response_code(200);
-                header("Content-Length: " . $filesize);
-            }
-
-            header('Accept-Ranges: bytes');
-            header("Content-Type: $mimeType");
-
-            header("Content-Disposition: attachment; filename=\"" . basename($key) . "\"");
-            header("Cache-Control: private");
-            header("Pragma: public");
-            header('X-Powered-By: S3');
-
-            // Seek to the requested range
-            fseek($fp, $start);
-
-            $remaining = $length;
-            $chunkSize = 8 * 1024 * 1024; // 8MB per chunk
-            while (!feof($fp) && $remaining > 0 && connection_aborted() == false) {
-                $buffer = fread($fp, min($chunkSize, $remaining));
-                echo $buffer;
-                $remaining -= strlen($buffer);
-                flush();
-            }
-
-            fclose($fp);
-            exit;
+            http_response_code(200);
+            header("Content-Length: " . $filesize);
         }
-        break;
+
+        header('Accept-Ranges: bytes');
+        header("Content-Type: $mimeType");
+
+        header("Content-Disposition: attachment; filename=\"" . basename($key) . "\"");
+        header("Cache-Control: private");
+        header("Pragma: public");
+        header('X-Powered-By: S3');
+
+        // Seek to the requested range
+        fseek($fp, $start);
+
+        $remaining = $length;
+        $chunkSize = 8 * 1024 * 1024; // 8MB per chunk
+        while (!feof($fp) && $remaining > 0 && connection_aborted() == false) {
+            $buffer = fread($fp, min($chunkSize, $remaining));
+            echo $buffer;
+            $remaining -= strlen($buffer);
+            flush();
+        }
+
+        fclose($fp);
+        exit;
+    }
+    break;
 
 
     case 'HEAD':
