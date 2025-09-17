@@ -2,7 +2,7 @@
 
 // Configuration
 define('DATA_DIR', __DIR__ . '/data'); // Use absolute path
-define('ALLOWED_ACCESS_KEYS', ['put_your_key_here']);
+define('ALLOWED_ACCESS_KEYS', ['152bf7de-f7ea-45c4-a2eb-f0d3a49e2d2e']);
 define('MAX_REQUEST_SIZE', 100 * 1024 * 1024); // 100MB
 
 // Helper functions
@@ -147,9 +147,26 @@ if ($method !== 'GET' && empty($bucket)) {
 
 // Fix 3: Handle root path LIST request
 if ($method === 'GET' && empty($bucket)) {
-    // Could return all buckets here (if needed)
-    generate_s3_error_response('400', 'Bucket name required', '/');
+    // List all buckets
+    $xml = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><ListAllMyBucketsResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></ListAllMyBucketsResult>');
+    $owner = $xml->addChild('Owner');
+    $owner->addChild('ID', 'local-owner');
+    $owner->addChild('DisplayName', 'Local S3');
+
+    $bucketsEl = $xml->addChild('Buckets');
+
+    foreach (glob(DATA_DIR . '/*', GLOB_ONLYDIR) as $dir) {
+        $bucketName = basename($dir);
+        $bucketEl = $bucketsEl->addChild('Bucket');
+        $bucketEl->addChild('Name', $bucketName);
+        $bucketEl->addChild('CreationDate', date('Y-m-d\TH:i:s.000\Z', filemtime($dir)));
+    }
+
+    header('Content-Type: application/xml');
+    echo $xml->asXML();
+    exit;
 }
+
 
 // Authentication check
 auth_check();
@@ -246,14 +263,40 @@ switch ($method) {
         break;
 
     case 'GET':
-        // Download object or list
+        // Handle GET (download or list)
         if (empty($key)) {
-            // List objects
+            // Check if it's a ListObjectsV2 request
+            if (isset($_GET['list-type']) && $_GET['list-type'] == '2') {
+                $prefix = $_GET['prefix'] ?? '';
+                $files = list_files($bucket, $prefix);
+
+                $xml = new SimpleXMLElement('<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"></ListBucketResult>');
+                $xml->addChild('Name', $bucket);
+                $xml->addChild('Prefix', $prefix);
+                $xml->addChild('KeyCount', strval(count($files)));
+                $xml->addChild('MaxKeys', '1000');
+                $xml->addChild('IsTruncated', 'false');
+
+                foreach ($files as $file) {
+                    $contents = $xml->addChild('Contents');
+                    $contents->addChild('Key', $file['key']);
+                    $contents->addChild('LastModified', date('Y-m-d\TH:i:s.000\Z', $file['timestamp']));
+                    $contents->addChild('ETag', '"' . md5_file(DATA_DIR . "/{$bucket}/{$file['key']}") . '"');
+                    $contents->addChild('Size', $file['size']);
+                    $contents->addChild('StorageClass', 'STANDARD');
+                }
+
+                header('Content-Type: application/xml');
+                echo $xml->asXML();
+                exit;
+            }
+
+            // Default fallback (ListObjects V1)
             $prefix = $_GET['prefix'] ?? '';
             $files = list_files($bucket, $prefix);
             generate_s3_list_objects_response($files, $bucket, $prefix);
         } else {
-            // Download object (with streaming and range support)
+            // Download object (unchanged)
             $filePath = DATA_DIR . "/{$bucket}/{$key}";
             if (!file_exists($filePath)) {
                 generate_s3_error_response('404', 'Object not found', "/{$bucket}/{$key}");
@@ -262,7 +305,7 @@ switch ($method) {
             // Get file size
             $filesize = filesize($filePath);
 
-            // Set headers
+            // Set default headers
             $mimeType = mime_content_type($filePath) ?: 'application/octet-stream';
             $fp = fopen($filePath, 'rb');
 
@@ -275,7 +318,7 @@ switch ($method) {
             $end = $filesize - 1;
             $length = $filesize;
 
-            // Handle Range header
+            // Check for Range header
             $range = $_SERVER['HTTP_RANGE'] ?? '';
             if ($range && preg_match('/^bytes=(\d*)-(\d*)$/', $range, $matches)) {
                 http_response_code(206); // Partial Content
@@ -306,7 +349,7 @@ switch ($method) {
             header("Pragma: public");
             header('X-Powered-By: S3');
 
-            // Seek and stream
+            // Seek to the requested range
             fseek($fp, $start);
 
             $remaining = $length;
@@ -322,6 +365,7 @@ switch ($method) {
             exit;
         }
         break;
+
 
     case 'HEAD':
         // Metadata only
